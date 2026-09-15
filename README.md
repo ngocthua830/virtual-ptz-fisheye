@@ -73,23 +73,23 @@ visualize*.py     rollout visualisation
 `scripts/*.sh` contain absolute paths from the machine they were run on — set the repo root at
 the top of each script before use.
 
-## ⚠️ Licence — not yet set, deliberately
+## Licence
 
-**This repo currently ships without a `LICENSE` file, which means all rights are reserved. That
-needs resolving before the code is genuinely "released".**
+**GNU Affero General Public License v3.0** (`LICENSE`).
 
-The reason it is not already chosen: `environments/fisheye_env.py` imports **Ultralytics**, which
-is **AGPL-3.0** absent a commercial licence. AGPL is copyleft, so distributing code built on it
-generally requires the distributed work to be AGPL-3.0 too. The same applies to the fine-tuned
-`yolo26n_*` detector weights, which is why they are not in the repo.
+AGPL-3.0 is chosen for compatibility, not preference: `environments/fisheye_env.py` uses
+**Ultralytics**, which is AGPL-3.0 absent a commercial licence, and AGPL is copyleft — work
+distributed on top of it must carry the same terms. The fine-tuned `yolo26n_*` detector weights
+are derived from the same stack and are therefore not distributed here either.
 
-Options, in the order we would consider them:
-1. **Adopt AGPL-3.0** for this repository — the straightforward, compatible choice.
-2. **Hold an Ultralytics enterprise licence**, which permits other terms.
-3. **Decouple the detector** behind an interface so the core environment and evaluation harness
-   carry no AGPL dependency, and license those permissively.
+If you need this under permissive terms, the detector is the only AGPL coupling and it is
+shallow — two call sites (`fisheye_env.py`, `evaluation/metrics.py`) behind a
+`predict(frame) -> boxes` boundary. Decoupling it behind an interface, with the Ultralytics
+adapter as an optional dependency the user installs, would leave the environments and the
+evaluation harness free to carry a permissive licence. Contributions doing that are welcome.
 
-This is a legal decision for the authors, not one to make by default.
+Note that the **evaluation harness itself** (`evaluation/`) has no detector dependency beyond
+the oracle call and is the part most likely to be reusable elsewhere.
 
 ## Citation
 
