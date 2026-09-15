@@ -1,0 +1,28 @@
+# data & artefacts — not redistributable / too large
+data/
+results/
+results_smoke/
+visualization*/
+logs/
+*.mp4
+*.avi
+
+# model weights — see the licence note in README.md
+*.pt
+*.pth
+*.onnx
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# latex build products
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.synctex.gz

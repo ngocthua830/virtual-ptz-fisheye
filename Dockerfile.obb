@@ -1,0 +1,51 @@
+# OBB-enabled image: adds the sibling project's custom ultralytics fork +
+# yolo_rapid and bumps numpy to 1.26.x so the fine-tuned OBB checkpoints load.
+#
+# Build (from the lab_fisheye project root):
+#   docker build -f Dockerfile.obb -t ptz-control-obb .
+#
+# Run (mounts the sibling project for the fork code + weights):
+#   docker run --gpus all --rm \
+#     -v "$(pwd)":/app -w /app \
+#     -v /home/thuann/CoreTeam_NAS/WorkingSpace/thuann/PhD/fisheye_person_detect:/sibling:ro \
+#     -e PYTHONPATH=/sibling/ultralytics:/sibling \
+#     ptz-control-obb \
+#     python visualize_dual.py --detector_weights /sibling/yolo26n_obb_topview_person.pt ...
+FROM python:3.10-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ffmpeg libgl1 libglib2.0-0 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir --upgrade pip
+
+# Torch + CUDA matching the host driver (CUDA 12.1 is fine on Tesla P40 / Quadro RTX).
+RUN pip install --no-cache-dir \
+    torch==2.5.1+cu121 torchvision==0.20.1+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# Numpy >=1.26 is the key bump (OBB checkpoint requirement) — also pull in
+# everything the env / agent needs.
+RUN pip install --no-cache-dir \
+    numpy==1.26.4 \
+    gym==0.26.2 \
+    matplotlib==3.8.4 \
+    opencv-python==4.9.0.80 \
+    pillow==10.3.0 \
+    tqdm==4.66.4 \
+    pycocotools==2.0.7 \
+    lapx==0.5.5
+
+# Don't install ultralytics from PyPI — the sibling fork is mounted at runtime
+# on /sibling/ultralytics and put on PYTHONPATH. But install its declared deps
+# so imports succeed.
+RUN pip install --no-cache-dir \
+    pyyaml requests scipy pandas seaborn psutil py-cpuinfo
+
+COPY . .
+
+ENV PYTHONPATH=/sibling/ultralytics:/sibling:/app
+
+CMD ["python", "visualize_dual.py", "--help"]
