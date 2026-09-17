@@ -18,10 +18,21 @@ from pathlib import Path
 
 import cv2
 import gym
+import math
 import numpy as np
 import torch
 
 from .scene_state import CoverageMap, TrackRegistry
+
+
+def _angular_sep_deg(b1, b2):
+    """Great-circle angle (deg) between two (azimuth, polar) bearings."""
+    a1, p1 = math.radians(b1[0]), math.radians(b1[1])
+    a2, p2 = math.radians(b2[0]), math.radians(b2[1])
+    v1 = (math.sin(p1) * math.cos(a1), math.sin(p1) * math.sin(a1), math.cos(p1))
+    v2 = (math.sin(p2) * math.cos(a2), math.sin(p2) * math.sin(a2), math.cos(p2))
+    dot = max(-1.0, min(1.0, sum(x * y for x, y in zip(v1, v2))))
+    return math.degrees(math.acos(dot))
 
 
 class FisheyePTZEnvironment(gym.Env):
@@ -78,6 +89,14 @@ class FisheyePTZEnvironment(gym.Env):
         self.ptz_out_w = int(self.config.get('ptz_out_w', 960))
         self.ptz_out_h = int(self.config.get('ptz_out_h', 540))
         self.base_fov = float(self.config.get('base_fov', 90.0))  # perspective FOV at zoom=1
+        # Gate for world-bearing identity association (deg).
+        self.assoc_gate_deg = float(
+            self.config.get('assoc_gate_deg', os.environ.get('ASSOC_GATE_DEG', 10.0)))
+        # Steps a track survives unseen. Under a swept camera a person is re-visited
+        # only once per raster period (~36 steps at 10 deg/step), so a short age makes
+        # the explorer re-earn its novelty bonus on every pass.
+        self.assoc_max_age = int(float(
+            self.config.get('assoc_max_age', os.environ.get('ASSOC_MAX_AGE', 8))))
 
         # Detection confidence threshold. A COCO YOLO needs a low threshold on
         # top-down poses (0.2). A top-view-fine-tuned OBB detector is confident
@@ -190,6 +209,7 @@ class FisheyePTZEnvironment(gym.Env):
     def reset(self):
         self.current_step = 0
         self.current_frame = 0
+        self.reset_tracks()
         self.pan = 0.0
         self.tilt = 30.0
         self.zoom = 1.0
@@ -236,7 +256,9 @@ class FisheyePTZEnvironment(gym.Env):
             self._detect_fisheye_circle(frame)
 
         ptz_view = self._get_ptz_view(frame)
-        self.last_detections = self._detect_objects(ptz_view)
+        self.last_detections = self._detect_objects(
+            ptz_view, pose=(float(self.pan), float(self.tilt), float(self.zoom)),
+            step=self.current_step)
         if self.last_detections:
             best = max(self.last_detections, key=lambda d: d['confidence'])
             self.target_id = best.get('track_id', -1)
@@ -252,7 +274,9 @@ class FisheyePTZEnvironment(gym.Env):
 
         frame = self._get_frame()
         ptz_view = self._get_ptz_view(frame)
-        self.last_detections = self._detect_objects(ptz_view)
+        self.last_detections = self._detect_objects(
+            ptz_view, pose=(float(self.pan), float(self.tilt), float(self.zoom)),
+            step=self.current_step)
 
         # Scene-level updates BEFORE building reward / state so both can use them.
         cov_reward_raw, n_sectors = self.scene.visit(
@@ -462,12 +486,24 @@ class FisheyePTZEnvironment(gym.Env):
 
     # ----------------------------------------------------------- detection
 
-    def _detect_objects(self, frame):
+    def reset_tracks(self):
+        """Clear the RE-ID pool. Must be called on episode reset: with
+        world-bearing association the ages are indexed by the episode's control
+        step, so tracks left over from a previous episode would otherwise have a
+        future ``last_step`` and never age out."""
+        self._obb_tracks = {}
+        self._obb_next_id = 1
+        self._obb_step = 0
+
+    def _detect_objects(self, frame, pose=None, step=None):
+        """``pose``=(pan, tilt, zoom) and ``step``=control-step index enable
+        world-bearing identity association (see ``_detect_objects_obb``). Omitting
+        them falls back to the legacy image-space IoU matching."""
         if self.detector is None or frame is None:
             return []
         try:
             if self.detector_is_obb:
-                return self._detect_objects_obb(frame)
+                return self._detect_objects_obb(frame, pose=pose, step=step)
             results = self.detector.track(
                 frame, persist=True, tracker='botsort.yaml',
                 conf=self.yolo_conf, verbose=False,
@@ -491,10 +527,20 @@ class FisheyePTZEnvironment(gym.Env):
         except Exception:
             return []
 
-    def _detect_objects_obb(self, frame):
+    def _detect_objects_obb(self, frame, pose=None, step=None):
         """OBB-model path: predict, convert each OBB to its axis-aligned envelope,
-        and assign cheap IoU-based track_ids across consecutive calls so the
-        agent's RE-ID continuity / novelty bonuses keep firing.
+        and assign track_ids so the agent's RE-ID continuity / novelty bonuses
+        keep firing.
+
+        Identity association runs in **world-bearing space** when ``pose`` is
+        supplied. The earlier image-space IoU matching had no compensation for the
+        camera's own motion, so a stationary person left the matching window purely
+        because the camera panned (up to 25 deg per step): measured at a fixed
+        scene, identities scaled with pan rate rather than with the number of
+        people, and 71% of detections at sweep speed were labelled "new". Bearings
+        are camera-independent, so one shared pool is now correct across both
+        virtual views -- the same person seen by either camera gets one identity --
+        and ages are counted in control steps rather than detector calls.
 
         Single-class detector (nc=1, 'person') is assumed — matches the
         sibling fisheye_person_detect cfg.
@@ -522,19 +568,58 @@ class FisheyePTZEnvironment(gym.Env):
                     'track_id': -1,
                 })
 
-        # ---- IoU-based RE-ID with a persistent track pool ----
-        # Each track keeps its last bbox + last-seen step so a brief miss
-        # (occlusion, dropped frame) doesn't spawn a new id. Matching against
-        # tracks seen within the last `max_age` steps, not just the previous
-        # frame, is what stops the runaway id inflation that made the explorer
-        # reward explode.
+        # ---- RE-ID with a persistent track pool ----
+        # Each track keeps its last position + last-seen step so a brief miss
+        # (occlusion, dropped frame) doesn't spawn a new id.
         if not hasattr(self, '_obb_tracks'):
-            self._obb_tracks = {}        # id -> {'bbox', 'last_step'}
+            self._obb_tracks = {}        # id -> {'bbox'|'bearing', 'last_step'}
             self._obb_next_id = 1
             self._obb_step = 0
-        self._obb_step += 1
-        max_age = 8                      # frames a track survives without a hit
+        max_age = self.assoc_max_age     # steps a track survives without a hit
         iou_match = 0.4                  # stricter than the old 0.3
+
+        if pose is not None:
+            # --- world-bearing association (camera-motion invariant) ---
+            self._obb_step = int(step) if step is not None else self._obb_step + 1
+            pan_, tilt_, zoom_ = pose
+            for d in dets:
+                d['bearing'] = self.world_bearing(
+                    d['bbox'], pan_, tilt_, zoom_,
+                    self.ptz_out_w, self.ptz_out_h, self.base_fov)
+            self._obb_tracks = {
+                tid: t for tid, t in self._obb_tracks.items()
+                if 0 <= self._obb_step - t['last_step'] <= max_age and 'bearing' in t
+            }
+            gate = self.assoc_gate_deg
+            # Globally best-first greedy: pair up the closest (detection, track)
+            # still available, rather than letting detection order decide.
+            pairs = []
+            for di, d in enumerate(dets):
+                for tid, t in self._obb_tracks.items():
+                    sep = _angular_sep_deg(d['bearing'], t['bearing'])
+                    if sep <= gate:
+                        pairs.append((sep, di, tid))
+            pairs.sort()
+            taken_d, taken_t = set(), set()
+            for sep, di, tid in pairs:
+                if di in taken_d or tid in taken_t:
+                    continue
+                dets[di]['track_id'] = tid
+                self._obb_tracks[tid] = {'bearing': dets[di]['bearing'],
+                                         'last_step': self._obb_step}
+                taken_d.add(di); taken_t.add(tid)
+            for di, d in enumerate(dets):
+                if di in taken_d:
+                    continue
+                tid = self._obb_next_id
+                self._obb_next_id += 1
+                d['track_id'] = tid
+                self._obb_tracks[tid] = {'bearing': d['bearing'],
+                                         'last_step': self._obb_step}
+            return dets
+
+        # --- legacy image-space IoU association (no pose supplied) ---
+        self._obb_step += 1
 
         def _iou(a, b):
             x1 = max(a[0], b[0]); y1 = max(a[1], b[1])

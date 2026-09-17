@@ -80,6 +80,15 @@ class DualFisheyePTZEnvironment(gym.Env):
         self.max_steps = int(self.config.get('max_steps', 128))
         # state_dim 29 = 12 per-camera + 12 scene/pair + 5 motion/zoom-control features.
         self.state_dim = int(self.config.get('state_dim', 29))
+        # Give the learned policy the full coverage grid instead of aggregates.
+        self.full_map = bool(self.config.get('full_map', False))
+        # A 157-D policy evaluated in a 29-D-aggregates environment would silently
+        # receive a zero map tail and look far worse than it is; refuse that.
+        if self.state_dim > 29 and not self.full_map:
+            raise ValueError(
+                f'state_dim={self.state_dim} > 29 but full_map=False: the extra '
+                'dimensions would be all zeros. Pass full_map=True to match how '
+                'such a checkpoint was trained.')
         self.num_actions = NUM_ACTIONS
 
         self.action_space = gym.spaces.MultiDiscrete([NUM_ACTIONS, NUM_ACTIONS])
@@ -159,6 +168,7 @@ class DualFisheyePTZEnvironment(gym.Env):
         self.last_detections = [[], []]
         self.target_id = None
         self.seen_track_ids = set()
+        self._host.reset_tracks()
         self.scene.reset()
         self.tracks.reset()
         self.last_cov_reward = [0.0, 0.0]
@@ -176,7 +186,9 @@ class DualFisheyePTZEnvironment(gym.Env):
         frame = self._host._get_frame()
         for i in range(2):
             view = self._host.project_view(frame, self.pan[i], self.tilt[i], self.zoom[i])
-            self.last_detections[i] = self._host._detect_objects(view)
+            self.last_detections[i] = self._host._detect_objects(
+                view, pose=(float(self.pan[i]), float(self.tilt[i]), float(self.zoom[i])),
+                step=self.current_step)
             for d in self.last_detections[i]:
                 tid = d.get('track_id', -1)
                 if tid != -1:
@@ -203,7 +215,9 @@ class DualFisheyePTZEnvironment(gym.Env):
         for i in range(2):
             v = self._host.project_view(frame, self.pan[i], self.tilt[i], self.zoom[i])
             views.append(v)
-            self.last_detections[i] = self._host._detect_objects(v)
+            self.last_detections[i] = self._host._detect_objects(
+                v, pose=(float(self.pan[i]), float(self.tilt[i]), float(self.zoom[i])),
+                step=self.current_step)
 
         # Update per-track world-bearing velocities from the tracker (cam-0) view.
         self._update_motion(self.last_detections[0])
@@ -582,6 +596,17 @@ class DualFisheyePTZEnvironment(gym.Env):
                 s[24] = self._vel_norm(self.target_id)    # locked-target motion
                 s[25] = min(self.static_steps / max(self.static_patience, 1), 1.0)
                 s[28] = min(self.steps_since_widen / max(self.pulse_period, 1), 1.0)
+
+        # Optional: append the FULL K x M coverage map (flattened) after the 29
+        # engineered features. The hand-coded heuristic baseline reads this grid
+        # directly while the learned policy otherwise sees only aggregates of it
+        # (total/per-band staleness, covered fraction, own gain) -- a state
+        # advantage in the baseline's favour. With `full_map` the two see the
+        # same information, which is what makes the comparison fair.
+        if self.full_map and self.state_dim > 29:
+            fm = self.scene.freshness().reshape(-1)
+            n = min(len(fm), self.state_dim - 29)
+            s[29:29 + n] = fm[:n]
         return s
 
     # ----------------------------------------------------------- misc

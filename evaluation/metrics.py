@@ -228,7 +228,7 @@ def inter_camera_overlap(axes, zooms, base_fov=90.0):
 _SPHERE_GRID = None
 
 
-def _sphere_grid(n_theta=90, n_phi=180):
+def _sphere_grid(n_theta=720, n_phi=1440):
     """Cache a full-sphere direction grid + per-cell solid-angle weights, so the
     continuous overlap metric integrates over the sphere rather than testing a
     single yes/no intersection. Returns (unit_vectors [N,3], weights [N])."""
@@ -263,6 +263,106 @@ def solid_angle_overlap(axes, zooms, base_fov=90.0):
         inter = float(W[in1 & in2].sum())
         union = float(W[in1 | in2].sum())
         ious.append((inter / union) if union > 0 else 0.0)
+    return float(np.mean(ious)) if ious else float('nan')
+
+
+# ----------------------------------------------------------------------
+# EXACT frustum overlap.
+#
+# The two functions above model each virtual view as a circular cap of
+# half-angle fov/2. The renderer does not produce a cap: project_view builds a
+# W x H rectilinear image with f = (W/2)/tan(fov/2), so ``base_fov`` is the
+# HORIZONTAL fov and the view is a rectangular pyramid -- 90.0 x 58.7 deg at
+# the default 960x540, whose corners reach 48.9 deg but whose top/bottom edges
+# reach only 29.4 deg. The cap is 1.30x too large in solid angle and, more
+# importantly, is wrong in the direction that matters here: two cameras at
+# opposite azimuth separate along the image's SHORT axis, so the cap test
+# reports redundancy between tilt 29.4 and 45 deg where the rendered views are
+# already disjoint. These functions test the actual image rectangle instead.
+# ----------------------------------------------------------------------
+
+def _cam_basis(pan_deg, tilt_deg):
+    """(right, up, forward) world vectors, matching project_view's rotation:
+    tilt about world X, then pan about world Z, optical axis -Z."""
+    t, p = math.radians(tilt_deg), math.radians(pan_deg)
+    ct, st_, cp, sp = math.cos(t), math.sin(t), math.cos(p), math.sin(p)
+
+    def rot(v):
+        x, y, z = v
+        ry = y * ct - z * st_
+        rz = y * st_ + z * ct
+        return np.array([x * cp - ry * sp, x * sp + ry * cp, rz], dtype=np.float64)
+
+    return rot((1.0, 0.0, 0.0)), rot((0.0, 1.0, 0.0)), rot((0.0, 0.0, -1.0))
+
+
+def _half_angles(base_fov, zoom, out_w, out_h):
+    """(horizontal, vertical, corner) half-angles in radians for one view."""
+    hfov = math.radians(base_fov / max(zoom, 1e-6))
+    f = (out_w / 2.0) / math.tan(hfov / 2.0)
+    return (hfov / 2.0,
+            math.atan((out_h / 2.0) / f),
+            math.atan(math.hypot(out_w / 2.0, out_h / 2.0) / f))
+
+
+def frustum_solid_angle(base_fov, zoom, out_w, out_h):
+    """Exact solid angle of one rectilinear view: 4*asin(sin(a/2)sin(b/2))."""
+    ha, va, _ = _half_angles(base_fov, zoom, out_w, out_h)
+    return 4.0 * math.asin(math.sin(ha) * math.sin(va))
+
+
+def _in_frustum(V, pan, tilt, zoom, base_fov, out_w, out_h):
+    """Boolean mask: which unit vectors project inside the rendered image."""
+    ha, va, _ = _half_angles(base_fov, zoom, out_w, out_h)
+    r, u, fw = _cam_basis(pan, tilt)
+    z = V @ fw
+    ok = z > 1e-12
+    zz = np.where(ok, z, 1.0)
+    return ok & (np.abs((V @ r) / zz) <= math.tan(ha)) \
+              & (np.abs((V @ u) / zz) <= math.tan(va))
+
+
+def _frustum_pair_iou(p1, p2, base_fov, out_w, out_h):
+    """Solid-angle IoU of two rendered views. Analytic areas + analytic
+    disjointness test; the grid is only touched when the bounding caps of the
+    two views actually intersect, which keeps this cheap for swept policies."""
+    (pan1, tilt1, z1), (pan2, tilt2, z2) = p1, p2
+    _, _, c1 = _half_angles(base_fov, z1, out_w, out_h)
+    _, _, c2 = _half_angles(base_fov, z2, out_w, out_h)
+    _, _, fw1 = _cam_basis(pan1, tilt1)
+    _, _, fw2 = _cam_basis(pan2, tilt2)
+    sep = math.acos(max(-1.0, min(1.0, float(fw1 @ fw2))))
+    o1 = frustum_solid_angle(base_fov, z1, out_w, out_h)
+    o2 = frustum_solid_angle(base_fov, z2, out_w, out_h)
+    if sep >= c1 + c2:                       # bounding caps miss -> exactly disjoint
+        return 0.0
+    V, W = _sphere_grid()
+    m1 = _in_frustum(V, pan1, tilt1, z1, base_fov, out_w, out_h)
+    m2 = _in_frustum(V, pan2, tilt2, z2, base_fov, out_w, out_h)
+    inter = float(W[m1 & m2].sum())
+    union = o1 + o2 - inter
+    return (inter / union) if union > 0 else 0.0
+
+
+def inter_camera_overlap_frustum(poses, base_fov=90.0, out_w=960, out_h=540):
+    """Fraction of steps where the two RENDERED views actually intersect.
+    ``poses[t]`` is [(pan, tilt, zoom), (pan, tilt, zoom)]. Exact counterpart of
+    ``inter_camera_overlap``."""
+    n = over = 0
+    for step in poses:
+        if len(step) < 2:
+            continue
+        n += 1
+        if _frustum_pair_iou(step[0], step[1], base_fov, out_w, out_h) > 0.0:
+            over += 1
+    return (over / n) if n else float('nan')
+
+
+def solid_angle_overlap_frustum(poses, base_fov=90.0, out_w=960, out_h=540):
+    """Mean solid-angle IoU of the two rendered views. Exact counterpart of
+    ``solid_angle_overlap``."""
+    ious = [_frustum_pair_iou(s[0], s[1], base_fov, out_w, out_h)
+            for s in poses if len(s) >= 2]
     return float(np.mean(ious)) if ious else float('nan')
 
 
@@ -311,7 +411,7 @@ def time_to_detect_mover(gt, agent, gate_deg=15.0):
 
 
 def all_metrics(gt, agent, axes, zooms, gate_deg=15.0, n_bins=36, base_fov=90.0,
-                frame_skip=5, fps=None):
+                frame_skip=5, fps=None, poses=None, out_w=960, out_h=540):
     m = {
         'n_gt_people': len(_first_present(gt)),
         'discovery_rate': discovery_rate(gt, agent, gate_deg),
@@ -324,6 +424,13 @@ def all_metrics(gt, agent, axes, zooms, gate_deg=15.0, n_bins=36, base_fov=90.0,
         'dwell_ratio_moving': dwell_ratio_moving(gt, agent, gate_deg),
         'time_to_detect_mover_steps': time_to_detect_mover(gt, agent, gate_deg),
     }
+    if poses is not None:
+        # Exact rendered-frustum overlap. The two keys above keep the circular-cone
+        # approximation for continuity with earlier runs; these are the correct ones.
+        m['inter_camera_overlap_frustum'] = inter_camera_overlap_frustum(
+            poses, base_fov, out_w, out_h)
+        m['solid_angle_overlap_frustum'] = solid_angle_overlap_frustum(
+            poses, base_fov, out_w, out_h)
     if fps:
         sec = frame_skip / float(fps)
         for k in ('time_to_detect_steps', 'time_to_detect_mover_steps'):
@@ -459,7 +566,7 @@ def rollout_gt(env, policy, steps, gate_deg=15.0, oracle_kwargs=None):
     states = env.reset()
 
     reader = _SeqReader(host.video_path)
-    gt_log, agent_log, axes_log, zoom_log = [], [], [], []
+    gt_log, agent_log, axes_log, zoom_log, pose_log = [], [], [], [], []
 
     for t in range(steps):
         cf = host.current_frame
@@ -477,6 +584,10 @@ def rollout_gt(env, policy, steps, gate_deg=15.0, oracle_kwargs=None):
         axes_log.append([_axis_bearing(host, float(env.pan[i]), float(env.tilt[i]),
                                        float(env.zoom[i])) for i in range(2)])
         zoom_log.append([float(env.zoom[0]), float(env.zoom[1])])
+        # Raw (pan, tilt, zoom) as well as the axis bearing: the exact frustum
+        # metric needs the camera's roll, which the bearing alone does not carry.
+        pose_log.append([(float(env.pan[i]), float(env.tilt[i]), float(env.zoom[i]))
+                         for i in range(2)])
 
         actions, params = policy.act(states, env)
         states, _r, done, _ = env.step(actions, params)
@@ -486,8 +597,10 @@ def rollout_gt(env, policy, steps, gate_deg=15.0, oracle_kwargs=None):
     reader.close()
     m = all_metrics(gt_log, agent_log, axes_log, zoom_log, gate_deg=gate_deg,
                     base_fov=host.base_fov, frame_skip=host.frame_skip,
-                    fps=reader.fps or None)
-    return m, {'gt': gt_log, 'agent': agent_log, 'axes': axes_log, 'zooms': zoom_log}
+                    fps=reader.fps or None, poses=pose_log,
+                    out_w=host.ptz_out_w, out_h=host.ptz_out_h)
+    return m, {'gt': gt_log, 'agent': agent_log, 'axes': axes_log,
+               'zooms': zoom_log, 'poses': pose_log}
 
 
 # ======================================================================
@@ -541,6 +654,29 @@ def _selftest():
     cov = coverage_pct(axes, n_bins=36)  # bins for 0,180,90,270 deg -> 4 bins
     if abs(cov - 4 / 36) > 1e-9:
         print(f'[FAIL] coverage_pct expected {4/36:.4f} got {cov}'); ok = False
+    # --- exact rendered-frustum geometry ---------------------------------
+    ha, va, co = _half_angles(90.0, 1.0, 960, 540)
+    for nm, got, want in (('HFOV', math.degrees(2 * ha), 90.0),
+                          ('VFOV', math.degrees(2 * va), 58.7155),
+                          ('corner', math.degrees(co), 48.9254)):
+        if abs(got - want) > 1e-3:
+            print(f'[FAIL] {nm} expected {want} got {got}'); ok = False
+    V_, W_ = _sphere_grid()
+    a_an = frustum_solid_angle(90.0, 1.0, 960, 540)
+    a_nu = float(W_[_in_frustum(V_, 0.0, 0.0, 1.0, 90.0, 960, 540)].sum())
+    if abs(a_an - a_nu) > 2e-3:
+        print(f'[FAIL] frustum solid angle analytic {a_an} vs grid {a_nu}'); ok = False
+    if abs(_frustum_pair_iou((30., 40., 1.), (30., 40., 1.), 90., 960, 540) - 1.0) > 2e-3:
+        print('[FAIL] identical views should have frustum IoU 1'); ok = False
+    # Two cameras at opposite azimuth separate along the image's SHORT axis, so
+    # the views go disjoint at tilt = VFOV/2 = 29.36 deg, NOT at fov/2 = 45 deg.
+    if _frustum_pair_iou((0., 29., 1.), (180., 29., 1.), 90., 960, 540) <= 0.0:
+        print('[FAIL] tilt 29 deg should still overlap'); ok = False
+    if _frustum_pair_iou((0., 30., 1.), (180., 30., 1.), 90., 960, 540) != 0.0:
+        print('[FAIL] tilt 30 deg should be disjoint'); ok = False
+    if _frustum_pair_iou((0., 48., 1.), (180., 48., 1.), 90., 960, 540) != 0.0:
+        print('[FAIL] tilt 48 deg should be disjoint'); ok = False
+
     ov = inter_camera_overlap(axes, [[1.0, 1.0], [1.0, 1.0]], base_fov=90.0)
     if abs(ov - 0.0) > 1e-9:  # cams 180 deg apart at the horizon, 90-deg FOV -> never overlap
         print(f'[FAIL] inter_camera_overlap expected 0 got {ov}'); ok = False
@@ -572,6 +708,9 @@ def _parse_args():
     ap.add_argument('--seeds', type=int, default=5)
     ap.add_argument('--seed_list', type=str, default=None)
     ap.add_argument('--state_dim', type=int, default=29)
+    ap.add_argument('--full_map', action='store_true',
+                    help='Observation carries the full coverage grid (state_dim 29 + K*M). '
+                         'Must match how the checkpoint was trained.')
     ap.add_argument('--policies', type=str, default='rl,random,sweep,greedy')
     ap.add_argument('--tracker', type=str, default=None)
     ap.add_argument('--explorer', type=str, default=None)
@@ -621,6 +760,7 @@ def main():
         'data_path': args.data_path, 'max_steps': args.steps,
         'state_dim': args.state_dim, 'detector_weights': args.detector_weights,
         'loop_video': bool(args.loop_video),  # default False: end at true clip end
+        'full_map': bool(args.full_map),
     })
 
     if args.seed_list:

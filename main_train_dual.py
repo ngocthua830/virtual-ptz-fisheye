@@ -58,6 +58,14 @@ def parse_args():
                    help='Anti-overlap penalty threshold (deg). 0 = no overlap penalty.')
     p.add_argument('--peripheral_weight', type=float, default=3.0,
                    help='Coverage peripheral weighting (rim). 1.0 = uniform weighting.')
+    p.add_argument('--state_dim', type=int, default=29)
+    p.add_argument('--full_map', action='store_true',
+                   help='Append the full 16x8 coverage grid to the observation '
+                        '(state_dim must be 29 + K*M).')
+    p.add_argument('--loaf_root', type=str, default=None,
+                   help='Train on LOAF sequences instead of the video clips.')
+    p.add_argument('--loaf_split', type=str, default='train')
+    p.add_argument('--loaf_seqs', type=str, default='')
     p.add_argument('--tag', type=str, default='',
                    help='Optional suffix appended to the run directory name.')
     return p.parse_args()
@@ -96,7 +104,15 @@ def train(args):
         'novelty_weight': args.novelty_weight,
         'overlap_thresh_deg': args.overlap_thresh_deg,
         'peripheral_weight': args.peripheral_weight,
+        'state_dim': args.state_dim,
+        'full_map': args.full_map,
     })
+    if getattr(args, 'loaf_root', None):
+        from evaluation.loaf import attach_multi
+        seqs = attach_multi(env, args.loaf_root, args.loaf_split,
+                            args.loaf_seqs.split(','), frame_skip=1, seed=args.seed)
+        print(f'[train] LOAF source: {len(seqs)} sequences '
+              f'({args.loaf_seqs}), frame_skip=1')
     tracker = make_agent(env, args)
     explorer = make_agent(env, args)
 

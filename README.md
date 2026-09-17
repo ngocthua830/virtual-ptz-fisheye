@@ -20,25 +20,55 @@ policy on **every** metric at once:
 
 | policy | discovery ↑ | time-to-detect ↓ | observed-time frac ↑ | solid-angle overlap ↓ |
 |---|---|---|---|---|
-| **Ovlp-Sweep (48°, no learning)** | **0.92** | **1.09** | **0.64** | **0.00** |
-| RL (5 seeds) | 0.68 ± 0.06 | 2.62 ± 0.96 | 0.50 ± 0.10 | 0.08 ± 0.07 |
-| Hybrid (5 seeds) | 0.72 ± 0.05 | 2.45 ± 1.01 | 0.51 ± 0.09 | 0.12 ± 0.02 |
-| random | 0.75 | 2.84 | 0.50 | 0.15 |
+| **Ovlp-Sweep (45°, no learning)** | **0.92** | **1.09** | 0.64 | **0.00** |
+| *static tiles K=2 (no control at all)* | *0.95* | *12.51* | *0.85* | — |
+| RL (5 seeds) | 0.68 ± 0.05 | 3.09 ± 1.61 | 0.50 ± 0.10 | 0.06 ± 0.02 |
+| RL + full coverage map (5 seeds) | 0.58 ± 0.11 | 4.69 ± 3.03 | 0.34 ± 0.14 | 0.03 ± 0.02 |
+| random | 0.74 | 3.04 | 0.49 | 0.10 |
 
-Two honest readings we want to keep attached to those numbers:
+(std is over the 5 training seeds, population convention. The sweep is *requested* at 48° with a
+±3° deadband, so the realised geometry is ~45°; the paper labels it by the realised tilt.)
 
-- **A `random` policy also reaches 0.50 observed-time fraction.** On this scene the learned
+Three honest readings we want to keep attached to those numbers:
+
+- **A `random` policy also reaches 0.49 observed-time fraction.** On this scene the learned
   controller buys no sustained-observation advantage over acting at random; its only edge there
   is worst-case gap.
-- **An earlier version of this work claimed the opposite.** A "2.8× faster, ties the sweep"
-  headline turned out to be an artefact of (i) evaluating a single training seed and (ii) a
-  video-looping bug that gave every policy ~5× its real observation window. Fixing both — five
-  independent seeds as the unit of analysis, each clip observed exactly once — reversed the
-  conclusion. That correction is why the evaluation harness in this repo looks the way it does.
+- **Giving the learned agent *more* observation does not help.** The hand-coded heuristic reads
+  the 16×8 coverage map directly while the policy saw only aggregates of it, so we ran the
+  control: re-training all five seeds with the raw map appended (157-D observation, same budget)
+  *widens* the gap rather than closing it — the `RL + full coverage map` row above. At fixed
+  capacity and episode count the wider observation is harder to learn from, not more
+  informative. We cannot exclude that a larger network or longer schedule would exploit it.
+- **Earlier versions of this work claimed the opposite, twice.** First, a "2.8× faster, ties the
+  sweep" headline turned out to be an artefact of (i) evaluating a single training seed and
+  (ii) a video-looping bug that gave every policy ~5× its real observation window. Second, on
+  LOAF we briefly measured learned control *beating* geometry on dense scenes — that was a
+  **mis-tuned baseline**: the sweep was pinned at a tilt chosen for our room while the learned
+  policy was free to vary tilt (60° ± 21° vs 45° ± 1°). Re-tuning the baseline on the new scene,
+  with the tilt selected **leave-one-sequence-out** so no test label enters the choice, reversed
+  it again. Both corrections are why the evaluation harness looks the way it does.
 
 The regime matters: two wide, non-overlapping views already blanket a small, fully-observable
 room, so the prioritisation and zoom that active control buys have nothing to win. We expect the
 answer to flip in scenes too large, dense or occluded for wide static views.
+
+## It is not just our room: LOAF
+
+The same comparison runs on six held-out sequences of the public **LOAF** dataset (ICCV 2023) —
+ceiling-mounted overhead fisheye, 2048², 5.1–31.3 people/frame, scored against **human**
+annotations rather than a detector-based pseudo-reference, with a sequence-level split so the
+detector never saw these frames.
+
+With the geometric baseline's aim chosen **leave-one-sequence-out** (which returns 65° for every
+sequence — per-scene tuning turned out to be unnecessary), the tuned sweep beats the
+room-trained policy on **4/6** sequences, and policies *retrained on those dense scenes* on
+**6/6**. Static tiles, which win in our room, win only **1/6** here — the tile advantage tracks
+how concentrated occupancy is, and is not a general claim that control is unnecessary.
+
+Reproduce with `evaluation/run_loaf.py` (loader: `evaluation/loaf.py`), drivers in
+`scripts/loaf_*.sh` / `scripts/loaf_*.py`; `scripts/loaf_tilt.py` is the LOSO tilt selection.
+
 
 ## Layout
 
@@ -50,14 +80,23 @@ environments/     virtual-PTZ gym environments
   scene_state.py      track registry / scene bookkeeping
 evaluation/       the reward-independent measurement harness
   metrics.py          discovery, time-to-detect, coverage%, inter-camera + solid-angle overlap,
-                      observed-time fraction, max unobserved gap; oracle on the raw fisheye
+                      observed-time fraction, max unobserved gap; oracle on the raw fisheye.
+                      Overlap uses the EXACT rendered frustum, not a cone: at base_fov=90 the
+                      view is a 90.0°×58.7° pyramid (corners 48.9°, top/bottom edges 29.4°), so
+                      a 45° spherical cap overstates its solid angle by 1.30×. Two axes 180°
+                      apart are disjoint for tilt >= VFOV/2 = 29.4°, not 45°.
   survival_ttd.py     censoring-aware latency (Kaplan-Meier, restricted-mean TTD)
   horizon_curve.py    discovery vs observation budget, fixed-cohort
   tilt_curve.py       tilt sensitivity of the geometric sweep
+  loaf.py             LOAF dataset loader: sequence split, human annotations -> reference tracks
+  run_loaf.py         run any policy on a LOAF sequence against those references
+models/agent/     MP-DQN dual-agent (tracker + explorer), parameterized action space
 baselines/        non-learned policies: sweep, coordinated sweep, overlap-optimized sweep,
                   greedy, heuristic, random  (+ multi-seed evaluation drivers)
 configs/          scenario configuration
-scripts/          run/eval drivers used for the paper's tables
+scripts/          every driver that produced a number in the paper; scripts/README.md maps
+                  each script to the claim it backs (tile_baseline.py, loaf_tilt.py,
+                  fullmap_train.sh, frustum_check.py, timing.py, ...)
 main_train*.py    training entry points (single / dual)
 visualize*.py     rollout visualisation
 ```
@@ -97,5 +136,12 @@ Paper under review; citation block will be added on acceptance.
 
 ## Status
 
-Source and evaluation harness are published here as the artefact accompanying the submission.
-Figures, tables and the run artefacts they were computed from are being prepared for release.
+Source and evaluation harness are published here as the artefact accompanying the submission,
+synced 2026-09-17 to match the submitted version of the paper — this adds the LOAF evaluation
+(`evaluation/loaf.py`, `run_loaf.py`), the exact rendered-frustum overlap metric, the full-map
+observation control (`--full_map`), the MP-DQN agent under `models/agent/`, and every driver
+script behind the paper's tables.
+
+The LOAF dataset itself is not redistributed here; obtain it from its authors and point
+`--loaf_root` at it. Figures and the run artefacts the tables were computed from are being
+prepared for release.
