@@ -712,6 +712,7 @@ def _parse_args():
                     help='Observation carries the full coverage grid (state_dim 29 + K*M). '
                          'Must match how the checkpoint was trained.')
     ap.add_argument('--policies', type=str, default='rl,random,sweep,greedy')
+    ap.add_argument('--ppo_dir', type=str, default=None, help='dir with tracker_best.pt/explorer_best.pt from ppo_continuous.py')
     ap.add_argument('--tracker', type=str, default=None)
     ap.add_argument('--explorer', type=str, default=None)
     ap.add_argument('--device', type=str, default='cuda')
@@ -748,7 +749,7 @@ def main():
     import torch
     from environments.dual_fisheye_env import DualFisheyePTZEnvironment, NUM_ACTIONS
     from models.agent.mpdqn_agent import MPDQNAgent
-    from baselines.evaluate import (RandomPolicy, SweepPolicy, GreedyPolicy,
+    from baselines.evaluate import (PPOContinuousPolicy, RandomPolicy, SweepPolicy, GreedyPolicy,
                                      HeuristicPolicy, CoordinatedSweepPolicy, RLPolicy,
                                      HybridPolicy, SmartHybridPolicy,
                                      OverlapOptimizedSweepPolicy)
@@ -794,6 +795,20 @@ def main():
                             hidden_layers=[256, 128, 64], device=args.device)
             tr.load(args.tracker); ex.load(args.explorer)
             return RLPolicy(tr, ex)
+        if name == 'ppo':
+            if not args.ppo_dir:
+                return None
+            import torch as _t
+            sys.path.insert(0, '/app')
+            from scripts.ppo_continuous import ActorCritic
+            ags = []
+            for nm in ('tracker', 'explorer'):
+                ac = ActorCritic().to(args.device)
+                ac.load_state_dict(_t.load(f'{args.ppo_dir}/{nm}_best.pt', map_location=args.device))
+                ac.eval(); ags.append(ac)
+            return PPOContinuousPolicy(ags, np.array([env.pan_speed, env.tilt_speed,
+                                        env.zoom_speed], dtype=np.float32),
+                                       env.tilt_range, env.zoom_range, args.device)
         if name == 'hybrid':
             if not args.tracker:
                 return None

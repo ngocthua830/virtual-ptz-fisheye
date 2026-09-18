@@ -40,3 +40,20 @@ mounted at `/app` inside the `ptz-control-obb` image.
 ## Ablations / variants
 - `eval_ablation.sh`, `run_matrix.sh`, `run_rl.sh`, `run_single.sh`, `eval_single.sh`,
   `eval_horizon.sh`, `eval_horizon5.sh`, `eval_ovsweep_tilt.sh`.
+
+
+## Added 2026-09-18
+
+- `ppo_continuous.py` — the **continuous-action PPO baseline** (Table 1, `PPO cont.` row). Each
+  agent emits (d_pan, d_tilt, d_zoom) scaled by the same per-step speed limits the discrete
+  vocabulary uses. Evaluate it through the normal harness:
+  `python -m evaluation.metrics --policies ppo --ppo_dir <run dir> ...`
+  (`PPOContinuousPolicy` lives in `baselines/evaluate.py`; `--ppo_dir` is in `evaluation/metrics.py`.)
+- `evaluation/horizon_curve.py` — `HORIZONS` now starts at 5, so the paper's "5–300 step budgets"
+  claim is reproducible. It was `[30, 60, 90, 150, 300]`.
+- `mkfig.py` — builds Fig. 1 (fisheye + the two rendered crops). Replicates
+  `fisheye_env.project_view` exactly rather than approximating it.
+- `oracle_headroom.py` — hindsight-oracle view selection. **Not used in the paper.** The
+  cumulative "ever covered" measure it computes saturates at 1.000 (two freely-placed views
+  eventually cover everyone over 300 steps), so it bounds nothing useful. Kept because the
+  per-step variant of the same measurement is informative; see the header comment.

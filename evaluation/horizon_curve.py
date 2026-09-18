@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from evaluation.metrics import (rollout_gt, _discovery_events, _first_present)
 
-HORIZONS = [30, 60, 90, 150, 300]
+HORIZONS = [5, 10, 15, 20, 30, 60, 90, 150, 300]
 
 
 def _curve_from_logs(logs, gate_deg):

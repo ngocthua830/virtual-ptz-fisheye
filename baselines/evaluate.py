@@ -262,6 +262,37 @@ class HeuristicPolicy:
         return (a0, a1), (p0, p1)
 
 
+class PPOContinuousPolicy:
+    """Continuous-action PPO controller (scripts/ppo_continuous.py).
+
+    Emits (d_pan, d_tilt, d_zoom) per camera, scaled by the same per-step speed
+    limits the discrete vocabulary uses, applies them directly, then returns STAY
+    so the environment's step() performs no further action. Deterministic at
+    evaluation (distribution mean), matching RLPolicy's greedy behaviour.
+    """
+    name = 'ppo'
+    stochastic = False
+
+    def __init__(self, agents, speeds, tilt_range, zoom_range, device='cuda'):
+        self.agents, self.sp = agents, speeds
+        self.tr, self.zr, self.device = tilt_range, zoom_range, device
+
+    def reset(self):
+        pass
+
+    def act(self, states, env):
+        import numpy as _np, torch as _t
+        for i in range(2):
+            o = _t.as_tensor(_np.asarray(states[i], dtype=_np.float32), device=self.device)
+            with _t.no_grad():
+                a = _t.tanh(self.agents[i].pi(o)).cpu().numpy()      # mean action
+            d = _np.clip(a, -1.0, 1.0) * self.sp
+            env.pan[i]  = float(((env.pan[i] + d[0] + 180.0) % 360.0) - 180.0)
+            env.tilt[i] = float(_np.clip(env.tilt[i] + d[1], self.tr[0], self.tr[1]))
+            env.zoom[i] = float(_np.clip(env.zoom[i] + d[2], self.zr[0], self.zr[1]))
+        return (0, 0), (0.0, 0.0)
+
+
 class RLPolicy:
     """Wraps the trained MP-DQN tracker/explorer agents (greedy, no exploration)."""
     name = 'rl'
