@@ -54,9 +54,9 @@ class RandomPolicy:
         pass
 
     def act(self, states, env):
-        a = (int(self.rng.integers(0, env.num_actions)),
-             int(self.rng.integers(0, env.num_actions)))
-        p = (float(self.rng.random()), float(self.rng.random()))
+        K = len(states)
+        a = tuple(int(self.rng.integers(0, env.num_actions)) for _ in range(K))
+        p = tuple(float(self.rng.random()) for _ in range(K))
         return a, p
 
 
@@ -159,9 +159,10 @@ class OverlapOptimizedSweepPolicy:
 
     def act(self, states, env):
         self.t += 1
-        acts = [STAY, STAY]
-        params = [1.0, 1.0]
-        for i in range(2):
+        K = len(states)
+        acts = [STAY] * K
+        params = [1.0] * K
+        for i in range(K):
             tilt = float(env.tilt[i])
             if abs(tilt - self.target_tilt) > 3.0:          # drive both axes into the high band
                 acts[i] = TILT_UP if tilt < self.target_tilt else TILT_DOWN
@@ -199,9 +200,8 @@ class GreedyPolicy:
         return STAY, 1.0                             # well framed
 
     def act(self, states, env):
-        a0, p0 = self._act_one(states[0])
-        a1, p1 = self._act_one(states[1])
-        return (a0, a1), (p0, p1)
+        out = [self._act_one(s) for s in states]
+        return tuple(a for a, _ in out), tuple(p for _, p in out)
 
 
 class HeuristicPolicy:
@@ -309,6 +309,27 @@ class RLPolicy:
         a_t, p_t = self.tracker.choose_action(states[0], training=False)
         a_e, p_e = self.explorer.choose_action(states[1], training=False)
         return (int(a_t), int(a_e)), (float(p_t), float(p_e))
+
+
+class SoloPolicy:
+    """K=1: a single MP-DQN agent driving the one available crop.
+
+    Trained by ``main_train_solo.py`` in the same environment with ``n_cams=1``;
+    the observation layout is the shared 29-D vector with the two pair-geometry
+    features held at zero (there is no partner).
+    """
+    name = 'solo'
+    stochastic = False
+
+    def __init__(self, agent):
+        self.agent = agent
+
+    def reset(self):
+        pass
+
+    def act(self, states, env):
+        a, p = self.agent.choose_action(states[0], training=False)
+        return (int(a),), (float(p),)
 
 
 class HybridPolicy:

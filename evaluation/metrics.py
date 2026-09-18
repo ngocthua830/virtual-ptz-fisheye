@@ -713,6 +713,10 @@ def _parse_args():
                          'Must match how the checkpoint was trained.')
     ap.add_argument('--policies', type=str, default='rl,random,sweep,greedy')
     ap.add_argument('--ppo_dir', type=str, default=None, help='dir with tracker_best.pt/explorer_best.pt from ppo_continuous.py')
+    ap.add_argument('--n_cams', type=int, default=2, choices=[1, 2],
+                    help='K: rendered+detected crops per source frame (1 = solo arm).')
+    ap.add_argument('--solo', type=str, default=None,
+                    help='path to solo_best.pt from main_train_solo.py (implies --n_cams 1)')
     ap.add_argument('--tracker', type=str, default=None)
     ap.add_argument('--explorer', type=str, default=None)
     ap.add_argument('--device', type=str, default='cuda')
@@ -757,11 +761,14 @@ def main():
     if args.device == 'cuda' and not torch.cuda.is_available():
         args.device = 'cpu'
 
+    if args.solo:
+        args.n_cams = 1
     env = DualFisheyePTZEnvironment({
         'data_path': args.data_path, 'max_steps': args.steps,
         'state_dim': args.state_dim, 'detector_weights': args.detector_weights,
         'loop_video': bool(args.loop_video),  # default False: end at true clip end
         'full_map': bool(args.full_map),
+        'n_cams': int(args.n_cams),
     })
 
     if args.seed_list:
@@ -795,6 +802,14 @@ def main():
                             hidden_layers=[256, 128, 64], device=args.device)
             tr.load(args.tracker); ex.load(args.explorer)
             return RLPolicy(tr, ex)
+        if name == 'solo':
+            if not args.solo:
+                raise SystemExit('--solo <solo_best.pt> is required for the solo policy')
+            from baselines.evaluate import SoloPolicy
+            ag = MPDQNAgent(state_dim=args.state_dim, num_actions=NUM_ACTIONS,
+                            hidden_layers=[256, 128, 64], device=args.device)
+            ag.load(args.solo)
+            return SoloPolicy(ag)
         if name == 'ppo':
             if not args.ppo_dir:
                 return None

@@ -41,19 +41,22 @@ mounted at `/app` inside the `ptz-control-obb` image.
 - `eval_ablation.sh`, `run_matrix.sh`, `run_rl.sh`, `run_single.sh`, `eval_single.sh`,
   `eval_horizon.sh`, `eval_horizon5.sh`, `eval_ovsweep_tilt.sh`.
 
+### K=1 view-budget arm (paper §5.3, "Nor of the view budget")
+| script | produces |
+|---|---|
+| `train_solo_k1.sh` | trains the 5 K=1 seeds (`main_train_solo.py`, `n_cams=1`), same 100×128 budget and hyper-parameters as the K=2 runs |
+| `eval_k1.sh` | evaluates those 5 seeds plus the K=1 no-learning references (ovsweep/random/greedy) on the same held-out clips |
+| `k1_summary.py` | prints both arms side by side and Δ(K) = sweep − learned, with per-seed win counts |
 
-## Added 2026-09-18
+K=1 is selected with `--n_cams 1` (or `--solo <solo_best.pt>`, which implies it) in
+`evaluation/metrics.py`. At K=1 the pair-geometry observation features `s[12]` (azimuth
+separation) and `s[23]` (partner pan) are held at zero and the anti-overlap reward term is
+inactive, since there is no partner view; the single agent receives **both** the tracker and
+explorer reward terms, because it must follow *and* discover. `OverlapOptimizedSweepPolicy`
+degenerates to a plain single-camera raster at K=1 for the same reason — worth remembering when
+reading the narrowed gap.
 
-- `ppo_continuous.py` — the **continuous-action PPO baseline** (Table 1, `PPO cont.` row). Each
-  agent emits (d_pan, d_tilt, d_zoom) scaled by the same per-step speed limits the discrete
-  vocabulary uses. Evaluate it through the normal harness:
-  `python -m evaluation.metrics --policies ppo --ppo_dir <run dir> ...`
-  (`PPOContinuousPolicy` lives in `baselines/evaluate.py`; `--ppo_dir` is in `evaluation/metrics.py`.)
-- `evaluation/horizon_curve.py` — `HORIZONS` now starts at 5, so the paper's "5–300 step budgets"
-  claim is reproducible. It was `[30, 60, 90, 150, 300]`.
-- `mkfig.py` — builds Fig. 1 (fisheye + the two rendered crops). Replicates
-  `fisheye_env.project_view` exactly rather than approximating it.
-- `oracle_headroom.py` — hindsight-oracle view selection. **Not used in the paper.** The
-  cumulative "ever covered" measure it computes saturates at 1.000 (two freely-placed views
-  eventually cover everyone over 300 steps), so it bounds nothing useful. Kept because the
-  per-step variant of the same measurement is informative; see the header comment.
+### Fine-grained horizon sweep (paper Table 2)
+`eval_horizon_fine5.sh` replays all 5 bearing-corrected seeds at H = 5,10,15,20,30,60,90,150,300.
+The earlier `eval_horizon5.sh` only covered H ≥ 30; the H ≤ 20 rows are what showed the
+apparent 15–20 crossover to be a single-seed artefact.

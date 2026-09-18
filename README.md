@@ -24,16 +24,25 @@ policy on **every** metric at once:
 | *static tiles K=2 (no control at all)* | *0.95* | *12.51* | *0.85* | — |
 | RL (5 seeds) | 0.68 ± 0.05 | 3.09 ± 1.61 | 0.50 ± 0.10 | 0.06 ± 0.02 |
 | RL + full coverage map (5 seeds) | 0.58 ± 0.11 | 4.69 ± 3.03 | 0.34 ± 0.14 | 0.03 ± 0.02 |
-| random | 0.74 | 3.04 | 0.49 | 0.10 |
+| random (5 action seeds) | 0.61 | 5.14 | 0.39 | 0.07 |
+| K=1 solo agent (5 seeds) | 0.52 ± 0.13 | 11.9 | 0.33 | — |
+| K=1 sweep (no learning) | 0.71 | 2.81 | 0.39 | — |
 
 (std is over the 5 training seeds, population convention. The sweep is *requested* at 48° with a
 ±3° deadband, so the realised geometry is ~45°; the paper labels it by the realised tilt.)
 
 Three honest readings we want to keep attached to those numbers:
 
-- **A `random` policy also reaches 0.49 observed-time fraction.** On this scene the learned
-  controller buys no sustained-observation advantage over acting at random; its only edge there
-  is worst-case gap.
+- **The `random` row was wrong until 2026-09-18, and it mattered.** It had been computed from a
+  *single* action seed (0.74 discovery). Re-run over five action seeds it is **0.61**, so the
+  learned policy (0.68) does beat random — the earlier numbers had made the negative result look
+  stronger than the data supports. Two claims in the paper were corrected with it. Lesson: the
+  "one seed is not a sample" rule applies to *stochastic baselines*, not just to learned policies.
+- **Halving the view budget narrows the gap but does not close it.** At `K=1` (one crop, one
+  agent, five seeds retrained at the same budget) the sweep leads by 0.19 instead of 0.25 — but
+  learning still trails on 5/5 seeds at *both* budgets. Part of that narrowing is structural: at
+  K=1 the sweep's antipodal-disjointness construction has no partner to exploit, so it degenerates
+  to a plain raster. We read it as a trend, not a crossover.
 - **Giving the learned agent *more* observation does not help.** The hand-coded heuristic reads
   the 16×8 coverage map directly while the policy saw only aggregates of it, so we ran the
   control: re-training all five seeds with the raw map appended (157-D observation, same budget)

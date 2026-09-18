@@ -91,9 +91,16 @@ class DualFisheyePTZEnvironment(gym.Env):
                 'such a checkpoint was trained.')
         self.num_actions = NUM_ACTIONS
 
-        self.action_space = gym.spaces.MultiDiscrete([NUM_ACTIONS, NUM_ACTIONS])
+        # K = number of rendered+detected crops per source frame. K=2 is the
+        # tracker+explorer pair the paper uses throughout; K=1 is the tighter
+        # sensing budget, a single agent with no partner to coordinate with.
+        self.n_cams = int(self.config.get('n_cams', 2))
+        if self.n_cams not in (1, 2):
+            raise ValueError(f'n_cams must be 1 or 2, got {self.n_cams}')
+
+        self.action_space = gym.spaces.MultiDiscrete([NUM_ACTIONS] * self.n_cams)
         self.observation_space = gym.spaces.Box(
-            low=-2.0, high=10.0, shape=(2, self.state_dim),
+            low=-2.0, high=10.0, shape=(self.n_cams, self.state_dim),
         )
 
         # Per-camera last_action / reward / detection history (length 2)
@@ -184,7 +191,7 @@ class DualFisheyePTZEnvironment(gym.Env):
         self._host.reset()
 
         frame = self._host._get_frame()
-        for i in range(2):
+        for i in range(self.n_cams):
             view = self._host.project_view(frame, self.pan[i], self.tilt[i], self.zoom[i])
             self.last_detections[i] = self._host._detect_objects(
                 view, pose=(float(self.pan[i]), float(self.tilt[i]), float(self.zoom[i])),
@@ -202,7 +209,10 @@ class DualFisheyePTZEnvironment(gym.Env):
         return self._get_states()
 
     def step(self, actions, params=(1.0, 1.0)):
-        """actions: (a_tracker, a_explorer); params: (p_tracker, p_explorer)."""
+        """actions: (a_tracker, a_explorer); params: (p_tracker, p_explorer).
+        At K=1 both are length-1 and only camera 0 exists."""
+        actions = list(actions)[:self.n_cams]
+        params = list(params)[:self.n_cams]
         self.current_step += 1
         self._host.current_frame += self._host.frame_skip
         self.scene.tick()
@@ -212,7 +222,7 @@ class DualFisheyePTZEnvironment(gym.Env):
 
         frame = self._host._get_frame()
         views = []
-        for i in range(2):
+        for i in range(self.n_cams):
             v = self._host.project_view(frame, self.pan[i], self.tilt[i], self.zoom[i])
             views.append(v)
             self.last_detections[i] = self._host._detect_objects(
@@ -225,27 +235,33 @@ class DualFisheyePTZEnvironment(gym.Env):
         # ---- Shared scene-state updates (tracker first, then explorer) ----
         # Visiting order matters: a sector marked fresh by the tracker pays
         # nothing to the explorer. That's the collaboration mechanism.
-        for i in range(2):
+        for i in range(self.n_cams):
             cov_raw, n_sec = self.scene.visit(
                 float(self.pan[i]), float(self.tilt[i]), float(self.zoom[i]),
                 base_fov=self._host.base_fov,
             )
             self.last_cov_reward[i] = cov_raw / max(n_sec, 1)
         # Joint track registry update (used by explorer novelty + state).
-        self.tracks.update(
-            self.last_detections[0] + self.last_detections[1], self.scene.step,
-        )
+        det_all = [d for i in range(self.n_cams) for d in self.last_detections[i]]
+        self.tracks.update(det_all, self.scene.step)
 
-        rewards = [
-            self._tracker_reward(self.last_detections[0], int(actions[0])),
-            self._explorer_reward(self.last_detections[1], int(actions[1])),
-        ]
-        for d in self.last_detections[0] + self.last_detections[1]:
+        if self.n_cams == 1:
+            # One agent, one budget: it must both follow and discover, so it
+            # receives BOTH reward terms on its single view. The anti-overlap
+            # penalty is skipped inside _explorer_reward (no partner to avoid).
+            rewards = [self._tracker_reward(self.last_detections[0], int(actions[0]))
+                       + self._explorer_reward(self.last_detections[0], int(actions[0]))]
+        else:
+            rewards = [
+                self._tracker_reward(self.last_detections[0], int(actions[0])),
+                self._explorer_reward(self.last_detections[1], int(actions[1])),
+            ]
+        for d in det_all:
             tid = d.get('track_id', -1)
             if tid != -1:
                 self.seen_track_ids.add(tid)
 
-        for i in range(2):
+        for i in range(self.n_cams):
             self.last_action[i] = int(actions[i])
             self.last_reward[i] = rewards[i]
             self.reward_history[i].append(rewards[i])
@@ -509,23 +525,25 @@ class DualFisheyePTZEnvironment(gym.Env):
             reward -= 0.5
 
         # Anti-overlap with tracker: penalise small azimuth separation.
-        sep = _ang_diff(self.pan[1], self.pan[0])
-        if sep < self.overlap_thresh_deg:
-            reward -= (self.overlap_thresh_deg - sep) / self.overlap_thresh_deg
+        # Undefined at K=1 -- there is no partner view to be redundant with.
+        if self.n_cams > 1:
+            sep = _ang_diff(self.pan[1], self.pan[0])
+            if sep < self.overlap_thresh_deg:
+                reward -= (self.overlap_thresh_deg - sep) / self.overlap_thresh_deg
 
-        if action != self.last_action[1]:
+        if action != self.last_action[self.n_cams - 1]:
             reward -= 0.05
         # Explorer is the primary coverage agent — gets the full shared-map
         # staleness credit. After the tracker visits first, any sector still
         # stale is "uncovered" — perfect for the explorer to claim.
-        reward += self.coverage_weight * self.last_cov_reward[1]
+        reward += self.coverage_weight * self.last_cov_reward[self.n_cams - 1]
         return float(reward)
 
     # ----------------------------------------------------------- state
 
     def _get_states(self):
-        s = np.zeros((2, self.state_dim), dtype=np.float32)
-        for i in range(2):
+        s = np.zeros((self.n_cams, self.state_dim), dtype=np.float32)
+        for i in range(self.n_cams):
             s[i] = self._cam_state(i)
         return s
 
@@ -553,7 +571,9 @@ class DualFisheyePTZEnvironment(gym.Env):
             rel_area = ((x2 - x1) * (y2 - y1)) / (w * h)
             best_conf = target_det['confidence']
 
-        sep = _ang_diff(self.pan[1], self.pan[0])
+        # No partner at K=1: the pair-geometry features are held at zero so the
+        # 29-D layout (and every checkpoint shape) is unchanged.
+        sep = _ang_diff(self.pan[1], self.pan[0]) if self.n_cams > 1 else 0.0
 
         s = np.zeros(self.state_dim, dtype=np.float32)
         s[0] = num_dets / 5.0
@@ -583,7 +603,7 @@ class DualFisheyePTZEnvironment(gym.Env):
             s[22] = float(np.tanh(self.last_cov_reward[i]))
             # Each agent sees its OWN coverage gain, plus partner's pan (so it
             # can model where the other one is right now).
-            s[23] = (self.pan[1 - i] / 180.0)
+            s[23] = (self.pan[1 - i] / 180.0) if self.n_cams > 1 else 0.0
 
         # Motion / zoom-control features [24:29] — drive the tracker's
         # prefer-movers and zoom-regulation behaviour. The explorer (separate
