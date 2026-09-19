@@ -196,6 +196,83 @@ def max_unobserved_gap(gt, agent, gate_deg=15.0):
     return float(np.mean([st['maxrun'] for st in stats.values()]))
 
 
+def per_frame_pr(gt, agent, poses=None, gate_deg=15.0,
+                 base_fov=90.0, out_w=960, out_h=540):
+    """Per-frame precision/recall against the human boxes, with NO persistent IDs.
+
+    The discovery family is a *coverage* test and carries no precision term: a
+    reference person counts as seen if ANY detection lies within the gate, so
+    false positives are never penalised and one detection can cover two people.
+    This complements it with a genuine one-to-one assignment per frame:
+
+      * greedy closest-pair matching between reference bearings and agent
+        detections, each used at most once, both within ``gate_deg``;
+      * TP = matched pairs, FP = unmatched detections, FN = unmatched references.
+
+    ``recall`` is therefore system-level and coverage-limited (a person outside
+    both crops cannot be matched). ``precision`` needs no such restriction -- a
+    detection exists only where the policy looked.
+
+    ``recall_inview`` WOULD restrict the denominator to references actually inside
+    a rendered frustum, isolating detector quality from where the policy chose to
+    look. It is NOT TRUSTWORTHY and is not used in the paper: the frustum test
+    still marks matched people as out-of-view, so the invariant TP_inview == TP
+    fails on most sequences (LOAF 0051: recall .292 but "inview" .076, which is
+    impossible -- the inview denominator is a SUBSET containing every TP). The
+    third appearance of a bearing-convention bug in this codebase. We therefore
+    return NaN whenever the invariant is violated rather than a plausible-looking
+    wrong number, and set ``recall_inview_valid`` so a caller must opt in.
+    Fix and re-validate against the invariant before using it.
+    """
+    TP = FP = FN = 0
+    TP_iv = FN_iv = 0
+    for t, (people, dets) in enumerate(zip(gt, agent)):
+        refs = [p['bearing'] for p in people]
+        pairs = []
+        for i, rb in enumerate(refs):
+            for j, db in enumerate(dets):
+                d = angular_sep(rb, db)
+                if d <= gate_deg:
+                    pairs.append((d, i, j))
+        pairs.sort()
+        ur, ud = set(), set()
+        for _d, i, j in pairs:
+            if i in ur or j in ud:
+                continue
+            ur.add(i); ud.add(j)
+        TP += len(ur)
+        FP += len(dets) - len(ud)
+        FN += len(refs) - len(ur)
+        if poses is not None and t < len(poses):
+            # world_bearing has polar 0 = NADIR while bearing_to_vec puts polar 0 at
+            # +Z and the frustum optical axis is -Z. Same transform as
+            # scripts/oracle_headroom.py; using the raw bearing here silently
+            # returns an empty frustum (it did, once).
+            V = np.array([bearing_to_vec(b[0] + 90.0, 180.0 - b[1])
+                          for b in refs]) if refs else None
+            if V is not None and len(V):
+                inview = np.zeros(len(refs), dtype=bool)
+                for (pan, tilt, zoom) in poses[t]:
+                    inview |= _in_frustum(V, pan, tilt, zoom, base_fov, out_w, out_h)
+                for i in range(len(refs)):
+                    if inview[i]:
+                        if i in ur:
+                            TP_iv += 1
+                        else:
+                            FN_iv += 1
+    prec = TP / (TP + FP) if (TP + FP) else float('nan')
+    rec = TP / (TP + FN) if (TP + FN) else float('nan')
+    # A matched reference is by definition inside some frustum, so TP_inview must
+    # equal TP. Where it does not, the frustum test is wrong and the ratio is
+    # meaningless -- report NaN rather than a number someone might quote.
+    iv_valid = (poses is not None) and (TP_iv == TP) and (TP_iv + FN_iv > 0)
+    rec_iv = TP_iv / (TP_iv + FN_iv) if iv_valid else float('nan')
+    f1 = 2 * prec * rec / (prec + rec) if (prec == prec and rec == rec and prec + rec) else float('nan')
+    return {'precision': prec, 'recall': rec, 'recall_inview': rec_iv,
+            'recall_inview_valid': bool(iv_valid), 'f1': f1,
+            'tp': TP, 'fp': FP, 'fn': FN}
+
+
 def coverage_pct(axes, n_bins=36):
     """Fraction of azimuth bins (default 10 deg) that any camera axis pointed at
     over the episode. Pure trajectory metric — no ground truth needed."""

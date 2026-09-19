@@ -56,7 +56,43 @@ explorer reward terms, because it must follow *and* discover. `OverlapOptimizedS
 degenerates to a plain single-camera raster at K=1 for the same reason — worth remembering when
 reading the narrowed gap.
 
-### Fine-grained horizon sweep (paper Table 2)
+### Fine-grained horizon sweep (paper §5.1)
 `eval_horizon_fine5.sh` replays all 5 bearing-corrected seeds at H = 5,10,15,20,30,60,90,150,300.
 The earlier `eval_horizon5.sh` only covered H ≥ 30; the H ≤ 20 rows are what showed the
-apparent 15–20 crossover to be a single-seed artefact.
+apparent 15–20 crossover to be a single-seed artefact. (These had their own table in earlier
+drafts; the paper now states the numbers inline, so this script is the full record.)
+
+### Per-frame one-to-one precision/recall (paper §5.5)
+| script | produces |
+|---|---|
+| `loaf_pr.sh` | runs every policy on the six LOAF sequences with `per_frame_pr` wired in, writing `results/loaf/loaf_pr.json` |
+
+`per_frame_pr()` (in `evaluation/metrics.py`) is greedy closest-pair assignment inside the same
+15° gate, each reference and each detection used at most once. It charges for false positives,
+which the discovery family never does, and uses **no identities**.
+
+**Two traps, both of which cost us a rerun:**
+- `--ov_target_tilt` is the polar tilt itself and defaults to **48**, not 45 and not 65. The
+  paper's `sw@65` needs `--ov_target_tilt 65`. Check any new run against the published discovery
+  cells (0.603 / 0.372 / 0.559 / 0.908 / 0.535 / 0.740 for 0062/0055/0071/0051/0052/0054) before
+  trusting its P/R — that is how we caught a run at tilt 68.
+- `recall_inview` is **broken** and now returns `NaN` with `recall_inview_valid=False` unless
+  `TP_inview == TP` holds. Do not report it until the frustum test is fixed.
+
+### Dataset screening, and datasets we rejected
+| script | produces |
+|---|---|
+| `allocation_hardness.py` | ground-truth-only screen: `C_static*` (best fixed view pair, hindsight), `C_oracle` (best pair per frame), `H_alloc` = the headroom adaptive control competes for. No detector, no policy, no GPU. |
+| `frida_selftest.py` | known-answer checks on the FRIDA loader (bearing model, box centres, and that identities are *given* rather than re-derived) |
+
+Detection difficulty is **not** allocation difficulty: a crowded scene whose people all sit in one
+sector is trivial to allocate. We screened candidate datasets on `H_alloc` before spending GPU
+time, and that is why FRIDA (loader in `evaluation/frida.py`, driver `run_frida.py`) is released
+but not in the paper — its headroom is too small to separate controllers.
+
+### Reruns for reproducibility
+| script | produces |
+|---|---|
+| `rerun_headline_onedevice.sh` | re-runs every headline row on **one** device in one sequential pass. An earlier release mixed hardware; this moved the heuristic by 0.107 and MP-DQN from 0.68 to 0.63. |
+| `retrain_4x.sh` | 4× environment-budget retrain for PPO and MP-DQN, testing whether the deficit is undertraining (it is not) |
+| `fsac_baseline.py` | FSAC, four-sector alternating coverage: a budget-matched non-learned baseline that picks poses directly rather than slewing |
