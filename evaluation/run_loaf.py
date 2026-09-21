@@ -12,7 +12,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from evaluation.loaf import LoafSequence, load_annotations
 from evaluation.metrics import (discovery_rate, time_to_detect, observed_time_frac,
                                 max_unobserved_gap, inter_camera_overlap_frustum,
-                                solid_angle_overlap_frustum, per_frame_pr)
+                                solid_angle_overlap_frustum, per_frame_pr,
+                                assignment_grid, frustum_coverage)
 
 STAY, PAN_L, PAN_R, ZOOM_I, ZOOM_O, TILT_U, TILT_D = range(7)
 
@@ -94,6 +95,14 @@ def run(env, policy, seq, gt, steps, gate):
         **{('pr_' + k): v for k, v in per_frame_pr(
             g, agent, poses, gate, host.base_fov,
             host.ptz_out_w, host.ptz_out_h).items()},
+        # assignment rule x aggregation, holding everything else fixed (review #16)
+        **{('ag_' + k): v for k, v in assignment_grid(g, agent, gate).items()},
+        # GROUND-TRUTH instantaneous coverage: directly comparable to the
+        # allocation oracle's C_static* / C_oracle, which the detector-based
+        # numbers above are not.
+        'C_policy': frustum_coverage(g, poses, host.base_fov,
+                                     host.ptz_out_w, host.ptz_out_h),
+        'poses': [[list(v) for v in pz] for pz in poses],
     }
 
 
@@ -109,6 +118,8 @@ def main():
     ap.add_argument('--gate_deg', type=float, default=15.0)
     ap.add_argument('--state_dim', type=int, default=29)
     ap.add_argument('--device', default='cuda')
+    ap.add_argument('--abs_dir', default=None,
+                    help='dir with policy_best.pt from ppo_absolute.py (absppo/absppogru)')
     ap.add_argument('--ov_target_tilt', type=float, default=48.0,
                     help='requested tilt for ovsweep; 68 realises the tuned 65 deg')
     ap.add_argument('--out', required=True)
@@ -157,6 +168,15 @@ def main():
                                 hidden_layers=[256, 128, 64], device=a.device)
                 tr.load(a.tracker); ex.load(a.explorer)
                 pol = RLPolicy(tr, ex)
+            elif name in ('absppo', 'absppogru'):
+                if not a.abs_dir: continue
+                import torch as _t
+                from scripts.ppo_absolute import Policy as _AbsPolicy, BANK
+                from baselines.evaluate import AbsoluteViewPolicy
+                _p = _AbsPolicy(58, len(BANK), recurrent=(name == 'absppogru')).to(a.device)
+                _p.load_state_dict(_t.load(f'{a.abs_dir}/policy_best.pt', map_location=a.device))
+                _p.eval()
+                pol = AbsoluteViewPolicy(_p, BANK, a.device)
             else:
                 continue
             r = run(env, pol, seq, gt, a.steps, a.gate_deg)

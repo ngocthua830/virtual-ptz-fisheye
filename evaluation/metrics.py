@@ -790,6 +790,10 @@ def _parse_args():
                          'Must match how the checkpoint was trained.')
     ap.add_argument('--policies', type=str, default='rl,random,sweep,greedy')
     ap.add_argument('--ppo_dir', type=str, default=None, help='dir with tracker_best.pt/explorer_best.pt from ppo_continuous.py')
+    ap.add_argument('--abs_mask', action='store_true',
+                    help='policy was trained with the disjoint mask; apply it at eval too')
+    ap.add_argument('--abs_dir', type=str, default=None,
+                    help='dir with policy_best.pt from ppo_absolute.py (absppo / absppogru)')
     ap.add_argument('--n_cams', type=int, default=2, choices=[1, 2],
                     help='K: rendered+detected crops per source frame (1 = solo arm).')
     ap.add_argument('--solo', type=str, default=None,
@@ -901,6 +905,23 @@ def main():
             return PPOContinuousPolicy(ags, np.array([env.pan_speed, env.tilt_speed,
                                         env.zoom_speed], dtype=np.float32),
                                        env.tilt_range, env.zoom_range, args.device)
+        if name in ('absppo', 'absppogru'):
+            if not args.abs_dir:
+                return None
+            import torch as _t
+            sys.path.insert(0, '/app')
+            from scripts.ppo_absolute import Policy as _AbsPolicy, BANK
+            from baselines.evaluate import AbsoluteViewPolicy
+            rec = name.startswith('absppogru')
+            _dis = None
+            if args.abs_mask:
+                from scripts.ppo_absolute import disjoint_matrix
+                _dis = disjoint_matrix(BANK)
+            pol = _AbsPolicy(58, len(BANK), recurrent=rec, disjoint=_dis).to(args.device)
+            pol.load_state_dict(_t.load(f'{args.abs_dir}/policy_best.pt',
+                                        map_location=args.device))
+            pol.eval()
+            return AbsoluteViewPolicy(pol, BANK, args.device)
         if name == 'hybrid':
             if not args.tracker:
                 return None
@@ -984,3 +1005,72 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+def assignment_grid(gt, agent, gate_deg=15.0):
+    """The 2x2 that separates the ASSIGNMENT RULE from the AGGREGATION.
+
+    Review #16 was right that Sec. 5.5 changed two things at once -- many-to-one
+    -> one-to-one, and cumulative-by-identity -> per-frame -- so a narrowing gap
+    could not be attributed to either. This holds the predictions, frames,
+    reference, gate and seed fixed and varies only those two axes:
+
+                     | many-to-one (coverage)   | one-to-one (assignment)
+      per-frame      | pf_many                  | pf_one
+      cumulative(id) | cum_many == discovery    | cum_one
+
+    ``pf_*``  = matched person-frames / all person-frames.
+    ``cum_*`` = reference identities matched at least once / all identities.
+
+    Both cumulative cells still rest on the reconstructed LOAF ids, so this is a
+    diagnostic, not new ground-truth tracking.
+    """
+    pf_many = pf_one = pf_tot = 0
+    seen_many, seen_one, all_ids = set(), set(), set()
+    for people, dets in zip(gt, agent):
+        refs = [p['bearing'] for p in people]
+        ids = [p['id'] for p in people]
+        all_ids.update(ids)
+        pf_tot += len(refs)
+        # --- many-to-one: a detection may cover any number of people ---
+        for i, rb in enumerate(refs):
+            if any(angular_sep(rb, db) <= gate_deg for db in dets):
+                pf_many += 1
+                seen_many.add(ids[i])
+        # --- one-to-one: greedy closest pair, each used at most once ---
+        pairs = sorted((angular_sep(rb, db), i, j)
+                       for i, rb in enumerate(refs) for j, db in enumerate(dets)
+                       if angular_sep(rb, db) <= gate_deg)
+        ur, ud = set(), set()
+        for _d, i, j in pairs:
+            if i in ur or j in ud:
+                continue
+            ur.add(i); ud.add(j)
+            pf_one += 1
+            seen_one.add(ids[i])
+    n = max(len(all_ids), 1)
+    return {'pf_many': pf_many / max(pf_tot, 1), 'pf_one': pf_one / max(pf_tot, 1),
+            'cum_many': len(seen_many) / n, 'cum_one': len(seen_one) / n,
+            'person_frames': pf_tot, 'n_ids': len(all_ids)}
+
+
+def frustum_coverage(gt, poses, base_fov=90.0, out_w=960, out_h=540):
+    """Fraction of annotated person-frames falling inside a rendered frustum.
+
+    GROUND TRUTH ONLY -- no detector. This is the same quantity the allocation
+    oracle maximises (scripts/allocation_hardness.py), so C_policy computed here
+    is directly comparable to that script's C_static* and C_oracle. Review #16's
+    point: C_oracle - C_static* bounds what RE-AIMING buys, not what a real
+    controller leaves on the table, which needs C_oracle - C_policy.
+    """
+    inside = total = 0
+    for people, pose in zip(gt, poses):
+        if not people:
+            continue
+        V = np.array([bearing_to_vec(p['bearing'][0] + 90.0,
+                                     180.0 - p['bearing'][1]) for p in people])
+        m = np.zeros(len(people), dtype=bool)
+        for (pan, tilt, zoom) in pose:
+            m |= _in_frustum(V, pan, tilt, zoom, base_fov, out_w, out_h)
+        inside += int(m.sum()); total += len(people)
+    return inside / max(total, 1)

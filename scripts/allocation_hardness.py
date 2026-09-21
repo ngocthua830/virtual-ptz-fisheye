@@ -36,7 +36,14 @@ def wb_vec(az_w, polar_w):
     return bearing_to_vec(az_w + 90.0, 180.0 - polar_w)
 
 
-def view_grid(n_az=12, tilts=(45.0,)):
+def view_grid(n_az=12, tilts=(30.0, 45.0, 55.0, 65.0, 75.0)):
+    """Candidate poses the oracle may choose from.
+
+    The tilt list MUST cover the tilts the evaluated controllers actually use.
+    The first version searched tilt 45 only, while GeoSweep runs at 65 on LOAF --
+    so the "oracle" was beaten by a real policy 3-6x over and bounded nothing.
+    Review #16 flagged the view bank as the weak point and was right.
+    """
     return [(-180.0 + 360.0 * i / n_az, t, 1.0)
             for t in tilts for i in range(n_az)]
 
@@ -166,10 +173,14 @@ def main():
     ap.add_argument('--loaf_seqs', default='0062,0055,0071,0051,0052,0054')
     ap.add_argument('--max_frames', type=int, default=300)
     ap.add_argument('--n_az', type=int, default=12)
+    ap.add_argument('--tilts', default='30,45,55,65,75',
+                    help='candidate tilts; must span what the controllers use')
     a = ap.parse_args()
 
-    views = view_grid(a.n_az)
-    print('view grid: %d views at tilt 45, HFOV 90 (K=2 chosen from these)\n' % len(views))
+    tl = tuple(float(x) for x in a.tilts.split(','))
+    views = view_grid(a.n_az, tl)
+    print('view grid: %d views, %d azimuths x tilts %s, HFOV 90, zoom 1 '
+          '(K=2 chosen from these)\n' % (len(views), a.n_az, tl))
     hdr = '%-16s %6s %8s %9s %9s %8s %9s %9s' % (
         'sequence', 'frames', 'ppl/frm', 'C_static', 'C_oracle', 'H_alloc', 'H_spatial', 'V_temporal')
     print(hdr); print('-' * len(hdr))

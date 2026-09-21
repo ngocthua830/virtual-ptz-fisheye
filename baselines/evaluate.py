@@ -262,6 +262,53 @@ class HeuristicPolicy:
         return (a0, a1), (p0, p1)
 
 
+class AbsoluteViewPolicy:
+    """Centralized ABSOLUTE-view controller (scripts/ppo_absolute.py).
+
+    One policy sees both cameras (58-D) and selects an ordered pair of poses
+    from the 12x4 view bank, setting pan/tilt/zoom OUTRIGHT -- the same
+    instantaneous re-pointing freedom FSAC has, with no incremental slew cap.
+    Returns STAY so the environment applies no further motion.
+
+    Deterministic at evaluation: argmax of each categorical head rather than a
+    sample, matching RLPolicy's and PPOContinuousPolicy's greedy behaviour. The
+    second head is masked so the two cameras cannot land on the same view.
+    """
+    name = 'absppo'
+    stochastic = False
+
+    def __init__(self, policy, bank, device='cuda'):
+        self.pol, self.bank, self.device = policy, bank, device
+        self.h = None
+
+    def reset(self):
+        self.h = None
+
+    def act(self, states, env):
+        import numpy as _np, torch as _t
+        o = _t.as_tensor(_np.concatenate([_np.asarray(states[0], dtype=_np.float32),
+                                          _np.asarray(states[1], dtype=_np.float32)]),
+                         device=self.device)
+        with _t.no_grad():
+            z, self.h = self.pol.feat(o, self.h)
+            v1 = int(_t.argmax(self.pol.h1(z)))
+            oh = _t.zeros(self.pol.n, device=o.device); oh[v1] = 1.0
+            lg = self.pol.h2(_t.cat([z, oh], -1)).clone()
+            # honour the SAME action mask the policy was trained under. A
+            # mask-trained policy evaluated without its mask could emit pairs it
+            # never saw in training, which would not be the policy we trained.
+            legal = getattr(self.pol, 'disjoint', None)
+            if legal is not None:
+                lg[~legal[v1]] = -1e9
+            else:
+                lg[v1] = -1e9
+            v2 = int(_t.argmax(lg))
+        for i, vi in enumerate((v1, v2)):
+            pan, tilt, zoom = self.bank[vi]
+            env.pan[i], env.tilt[i], env.zoom[i] = pan, tilt, zoom
+        return (STAY, STAY), (0.0, 0.0)
+
+
 class PPOContinuousPolicy:
     """Continuous-action PPO controller (scripts/ppo_continuous.py).
 

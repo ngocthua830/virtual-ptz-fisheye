@@ -99,9 +99,13 @@ class LoafSequence:
 
     def quality(self, max_frames=80):
         """90th-percentile nearest-neighbour ground displacement (cm) between
-        consecutive annotated frames. The stride is 0.5 s, so anything much above
-        ~250 cm (5 m/s) means the annotations cannot be tracked reliably and the
-        sequence should not carry identity-based metrics."""
+        consecutive annotated frames. LOAF annotates every 15th source frame; we do
+        not assert a wall-clock stride here, because the published sampling rate
+        (1 fps) and a 30 fps source disagree by 2x and nothing in the release
+        settles it. The gate is justified empirically instead: measured median
+        displacement is 67-98 cm, so anything much above ~250 cm means the
+        annotations cannot be tracked reliably and the sequence should not carry
+        identity-based metrics."""
         if self.R is None:
             self.read(0)
         prev, d = None, []
